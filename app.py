@@ -461,7 +461,7 @@ def load_model():
 
             # Create ResNet-50 with 40 output classes
             model = timm.create_model(
-                "resnet50",
+                "convnext_tiny",
                 pretrained=False,
                 num_classes=len(breed_labels)
             )
