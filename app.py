@@ -187,7 +187,7 @@ def set_custom_style():
         """
         <style>
         .stApp {
-            background: url('https://wallpaperaccess.com/full/1227835.jpg');
+            background: url('https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQlgrH8jilnVJPKdM25-NvT-3lxzJq6Wpu6Gv4lcHaLI9re9hO51vmXvZ8&s=10');
             background-size: cover;
             background-position: center;
             background-repeat: no-repeat;
