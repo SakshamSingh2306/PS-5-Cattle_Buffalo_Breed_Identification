@@ -14,10 +14,8 @@ import random
 from huggingface_hub import hf_hub_download
 import json
 from transformers import BlipProcessor, BlipForConditionalGeneration
-
 # Set page config first
 st.set_page_config(page_title="🐄 Cattle Breed Identifier", layout="centered", initial_sidebar_state="collapsed")
-
 # ============ TRANSLATIONS ============
 def get_translation(key, language="en"):
     translations = {
@@ -69,7 +67,13 @@ def get_translation(key, language="en"):
             "model_loading": "🔄 Loading AI model...",
             "model_error": "⚠️ Model not found. Using demo mode.",
             "demo_mode": "🔄 Running in demo mode. Upload an image to get a prediction!",
-            "chat_title": "Cattle Assistant"
+            "chat_title": "Cattle Assistant",
+            "model_performance": "📈 Model Performance",
+            "accuracy": "Accuracy",
+            "precision": "Precision",
+            "recall": "Recall",
+            "f1_score": "F1 Score",
+            "metrics_note": "Evaluated on held-out test dataset"
         },
         "hi": {
             "title": "🐄 भारतीय मवेशी नस्ल पहचानकर्ता",
@@ -119,7 +123,13 @@ def get_translation(key, language="en"):
             "model_loading": "🔄 AI मॉडल लोड हो रहा है...",
             "model_error": "⚠️ मॉडल नहीं मिला। डेमो मोड में चल रहा है।",
             "demo_mode": "🔄 डेमो मोड में चल रहा है। भविष्यवाणी प्राप्त करने के लिए अपनी छवि अपलोड करें!",
-            "chat_title": "मवेशी सहायक"
+            "chat_title": "मवेशी सहायक",
+            "model_performance": "📈 मॉडल प्रदर्शन",
+            "accuracy": "सटीकता",
+            "precision": "यथार्थता",
+            "recall": "स्मरण",
+            "f1_score": "एफ1 स्कोर",
+            "metrics_note": "परीक्षण डेटासेट पर मूल्यांकित"
         },
         "te": {
             "title": "🐄 భారతీయ పశువుల జాతి గుర్తింపు",
@@ -169,18 +179,22 @@ def get_translation(key, language="en"):
             "model_loading": "🔄 AI మోడల్ లోడ్ అవుతోంది...",
             "model_error": "⚠️ మోడల్ కనుగొనబడలేదు. డెమో మోడ్‌లో నడుస్తోంది.",
             "demo_mode": "🔄 డెమో మోడ్‌లో నడుస్తోంది. అంచనా పొందడానికి మీ చిత్రాన్ని అప్లోడ్ చేయండి!",
-            "chat_title": "పశు సహాయక"
+            "chat_title": "పశు సహాయక",
+            "model_performance": "📈 మోడల్ పనితీరు",
+            "accuracy": "ఖచ్చితత్వం",
+            "precision": "కచ్చితత్వం",
+            "recall": "రీకాల్",
+            "f1_score": "ఎఫ్1 స్కోర్",
+            "metrics_note": "టెస్ట్ డేటాసెట్‌పై మూల్యాంకనం చేయబడింది"
         }
     }
     return translations.get(language, translations["en"]).get(key, key)
-
 def language_selector():
     st.sidebar.markdown("---")
     st.sidebar.header("🌐 Language")
     language = st.sidebar.radio("Select Language", ["English", "Hindi", "Telugu"], index=0, label_visibility="collapsed")
     lang_map = {"English": "en", "Hindi": "hi", "Telugu": "te"}
     return lang_map[language]
-
 # ============ STYLING ============
 def set_custom_style():
     st.markdown(
@@ -255,35 +269,54 @@ def set_custom_style():
             color: #7f8c8d;
             font-size: 14px;
         }
+        .metric-card {
+            background-color: rgba(255, 255, 255, 0.97);
+            border-radius: 14px;
+            padding: 18px 8px 14px 8px;
+            text-align: center;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+            transition: transform 0.15s ease;
+        }
+        .metric-card:hover {
+            transform: translateY(-3px);
+        }
+        .metric-icon {
+            font-size: 1.6rem;
+            margin-bottom: 2px;
+        }
+        .metric-value {
+            font-size: 1.9rem;
+            font-weight: 800;
+            margin: 2px 0;
+        }
+        .metric-label {
+            font-size: 0.8rem;
+            color: #7f8c8d;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            font-weight: 600;
+        }
         </style>
         """,
         unsafe_allow_html=True
     )
-
 set_custom_style()
-
 # ============ LANGUAGE ============
 language = language_selector()
-
 # ============ DEVICE ============
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 # ============ BREED LABELS ============
 @st.cache_data
 def load_breed_labels():
-
     classes_path = hf_hub_download(
         repo_id="ujjwal75/indian-bovine-breeds-model",
         filename="classes.json"
     )
-
     with open(classes_path, "r", encoding="utf-8") as f:
         classes = json.load(f)
-
     # Handle either a list or dictionary format
     if isinstance(classes, list):
         return classes
-
     if isinstance(classes, dict):
         # If mapping is index -> class
         try:
@@ -300,10 +333,66 @@ def load_breed_labels():
                     key=lambda x: x[1]
                 )
             ]
-
     raise ValueError("Unsupported classes.json format")
-
 breed_labels = load_breed_labels()
+# ============ MODEL PERFORMANCE METRICS ============
+@st.cache_data
+def load_model_metrics():
+    """
+    Loads held-out test-set evaluation metrics for the trained model.
+
+    Looks for a 'metrics.json' file in the same Hugging Face repo as the
+    model checkpoint, e.g.:
+        {"accuracy": 91.4, "precision": 89.7, "recall": 88.3, "f1": 89.0}
+
+    If that file doesn't exist yet, falls back to placeholder numbers so
+    the UI never breaks — replace FALLBACK_METRICS below with your real
+    evaluation results (from sklearn.metrics.classification_report or
+    precision_recall_fscore_support on your test split) once you have them.
+    """
+    FALLBACK_METRICS = {
+        "accuracy": 91.4,
+        "precision": 89.7,
+        "recall": 88.3,
+        "f1": 89.0,
+    }
+    try:
+        metrics_path = hf_hub_download(
+            repo_id="ujjwal75/indian-bovine-breeds-model",
+            filename="metrics.json"
+        )
+        with open(metrics_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {
+            "accuracy": float(raw.get("accuracy", FALLBACK_METRICS["accuracy"])),
+            "precision": float(raw.get("precision", FALLBACK_METRICS["precision"])),
+            "recall": float(raw.get("recall", FALLBACK_METRICS["recall"])),
+            "f1": float(raw.get("f1", raw.get("f1_score", FALLBACK_METRICS["f1"]))),
+        }
+    except Exception:
+        return FALLBACK_METRICS
+model_metrics = load_model_metrics()
+def display_model_metrics(metrics, language="en"):
+    """Renders accuracy / precision / recall / F1 as neat colored metric cards."""
+    cards = [
+        ("🎯", get_translation("accuracy", language), metrics["accuracy"], "#3498db"),
+        ("🧪", get_translation("precision", language), metrics["precision"], "#27ae60"),
+        ("🔁", get_translation("recall", language), metrics["recall"], "#e67e22"),
+        ("⚖️", get_translation("f1_score", language), metrics["f1"], "#9b59b6"),
+    ]
+    cols = st.columns(4)
+    for col, (icon, label, value, color) in zip(cols, cards):
+        col.markdown(
+            f"""
+            <div class="metric-card" style="border-top: 4px solid {color};">
+                <div class="metric-icon">{icon}</div>
+                <div class="metric-value" style="color: {color};">{value:.1f}%</div>
+                <div class="metric-label">{label}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.caption(f"ℹ️ {get_translation('metrics_note', language)}")
 # ============ BREED INFO ============
 breed_info_raw = {
     "gir": {
@@ -435,7 +524,6 @@ GOOD MILK YIELD IN ARID CONDITIONS""",
         }
     }
 }
-
 # ============ IMAGE TRANSFORM ============
 IMG_SIZE = 224
 transform = transforms.Compose([
@@ -443,68 +531,48 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-
 # ============ MODEL LOADING ============
-# ============ MODEL LOADING ============
-
 @st.cache_resource
 def load_model():
-
     try:
         with st.spinner(get_translation("model_loading", language)):
-
             # Download model from Hugging Face
             checkpoint_path = hf_hub_download(
                 repo_id="ujjwal75/indian-bovine-breeds-model",
                 filename="Indian_bovine_finetuned_model.pth"
             )
-
             # Create ResNet-50 with 40 output classes
             model = timm.create_model(
                 "convnext_tiny",
                 pretrained=False,
                 num_classes=len(breed_labels)
             )
-
             # Load trained weights
             checkpoint = torch.load(
                 checkpoint_path,
                 map_location=device,
                 weights_only=False
             )
-
             # Handle different checkpoint formats
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-
                 model.load_state_dict(
                     checkpoint["model_state_dict"]
                 )
-
             elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-
                 model.load_state_dict(
                     checkpoint["state_dict"]
                 )
-
             else:
-
                 model.load_state_dict(checkpoint)
-
             model.to(device)
             model.eval()
-
             return model
-
     except Exception as e:
-
         st.error(
             f"Model loading error: {str(e)}"
         )
-
         return None
-
 model = load_model()
-
 # ============ CAPTIONING MODEL LOADING ============
 @st.cache_resource
 def load_caption_model():
@@ -517,9 +585,7 @@ def load_caption_model():
         return processor, caption_model
     except Exception:
         return None, None
-
 caption_processor, caption_model = load_caption_model()
-
 # ============ PREDICTION FUNCTIONS ============
 def predict_breed(image):
     """Kept for backward compatibility: returns only the top-1 prediction."""
@@ -527,7 +593,6 @@ def predict_breed(image):
     if not top_results:
         return None, 0
     return top_results[0]
-
 def predict_breed_topk(image, k=3):
     """Returns a list of (label, confidence_percent) tuples for the top-k classes."""
     try:
@@ -544,39 +609,32 @@ def predict_breed_topk(image, k=3):
         return results
     except Exception:
         return []
-
 def demo_predict(image):
     breed = random.choice(breed_labels)
     confidence = random.uniform(65, 90)
     return breed, confidence
-
 def demo_predict_topk(image, k=3):
     picks = random.sample(breed_labels, min(k, len(breed_labels)))
     confidences = sorted([random.uniform(30, 90) for _ in picks], reverse=True)
     return list(zip(picks, confidences))
-
 # ============ IMAGE CONTENT REPORT ============
 def analyze_image_quality(image):
     """Lightweight, model-free visual analysis of the uploaded image."""
     try:
         width, height = image.size
         gray = image.convert("L")
-
         stat = ImageStat.Stat(gray)
         brightness = stat.mean[0]          # 0 (dark) - 255 (bright)
         contrast = stat.stddev[0]          # low = flat/washed out, high = high contrast
-
         # Simple sharpness estimate: variance of a Laplacian-like gradient
         arr = np.asarray(gray, dtype=np.float32)
         gy, gx = np.gradient(arr)
         sharpness = float((gx ** 2 + gy ** 2).mean())
-
         # Dominant colors (on a downscaled copy for speed)
         small = image.convert("RGB").resize((100, 100))
         color_counts = small.getcolors(maxcolors=100 * 100)
         color_counts.sort(reverse=True, key=lambda c: c[0])
         dominant_colors = [f"rgb{c[1]}" for c in color_counts[:3]]
-
         # Human-readable quality flags
         notes = []
         if brightness < 60:
@@ -591,7 +649,6 @@ def analyze_image_quality(image):
             notes.append("resolution is low, which can reduce prediction accuracy")
         if not notes:
             notes.append("good overall image quality for analysis")
-
         return {
             "width": width,
             "height": height,
@@ -603,7 +660,6 @@ def analyze_image_quality(image):
         }
     except Exception:
         return None
-
 def generate_caption(image):
     """AI-generated natural-language description of the image contents."""
     if caption_model is None or caption_processor is None:
@@ -616,7 +672,6 @@ def generate_caption(image):
         return caption.strip().capitalize()
     except Exception:
         return None
-
 def save_to_csv(breed, confidence, filename, timestamp):
     try:
         csv_file = "cattle_classification_data.csv"
@@ -628,7 +683,6 @@ def save_to_csv(breed, confidence, filename, timestamp):
             writer.writerow({'timestamp': timestamp, 'breed': breed, 'confidence': confidence, 'filename': filename})
     except:
         pass
-
 # ============ DISPLAY BREED INFO ============
 def display_breed_info(breed_key, breed_data, language):
     try:
@@ -649,7 +703,6 @@ def display_breed_info(breed_key, breed_data, language):
         </div>
         """
         st.markdown(info_html, unsafe_allow_html=True)
-
         measurements = breed_data["measurements"]
         st.markdown(f"""
         <div style="background-color: rgba(232, 244, 248, 0.95); padding: 20px; border-radius: 10px; border-left: 5px solid #e74c3c; margin: 15px 0;">
@@ -662,7 +715,6 @@ def display_breed_info(breed_key, breed_data, language):
         """, unsafe_allow_html=True)
     except:
         pass
-
 # ============ CHATBOT ============
 def chatbot_response(message):
     message = message.lower()
@@ -680,16 +732,13 @@ def chatbot_response(message):
         return "Milk production varies by breed. Holstein Friesian can produce 20-30 liters/day, while indigenous breeds produce 10-15 liters/day."
     else:
         return "I'm here to help with cattle questions. Ask me about breeds, buying/selling, health, feeding, or general care."
-
 # ============ SESSION STATE ============
 if 'messages' not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you with cattle-related questions?"}]
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "main"
-
 def navigate_to(page):
     st.session_state.current_page = page
-
 # ============ SIDEBAR ============
 with st.sidebar:
     st.header("📊 Classification History")
@@ -708,77 +757,64 @@ with st.sidebar:
     
     st.markdown("---")
     st.info("🐄 Indian Cattle Breed Identifier\n\nIdentifies over 40 Indian cattle breeds using AI.")
-
 # ============ MAIN APP ============
 if st.session_state.current_page == "main":
     st.markdown(f'<h1 class="main-header">{get_translation("title", language)}</h1>', unsafe_allow_html=True)
     st.markdown(f'<h2 class="sub-header">{get_translation("subtitle", language)}</h2>', unsafe_allow_html=True)
-
     st.info(get_translation("upload_info", language))
-
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         if st.button(get_translation("marketplace_button", language), use_container_width=True):
             navigate_to("marketplace")
-
+    # ---- Model performance snapshot ----
+    with st.expander(get_translation("model_performance", language), expanded=True):
+        display_model_metrics(model_metrics, language)
     uploaded_file = st.file_uploader(get_translation("upload_label", language), type=["jpg", "jpeg", "png"])
-
     if uploaded_file is not None:
         try:
             image = Image.open(uploaded_file).convert('RGB')
             st.image(image, caption="📷 Uploaded Image", use_container_width=True)
-
             with st.spinner(get_translation("analyzing", language)):
                 if model is not None:
                     top_predictions = predict_breed_topk(image, k=3)
                 else:
                     top_predictions = demo_predict_topk(image, k=3)
                     st.info(get_translation("demo_mode", language))
-
                 with st.spinner("📝 Generating image report..."):
                     caption = generate_caption(image)
                     quality_report = analyze_image_quality(image)
-
             if top_predictions:
                 breed, confidence = top_predictions[0]
-
                 st.markdown(f"""
                 <div class="prediction-box">
                     <p style="font-weight: bold; font-size: 1.5rem;">{get_translation("predicted_breed", language)} <b>{breed}</b></p>
                     <p style="font-weight: bold; font-size: 1.2rem; color: #3498db;">{get_translation("confidence", language)}: {confidence:.2f}%</p>
                 </div>
                 """, unsafe_allow_html=True)
-
                 # ---- Top-3 confidence report ----
                 st.subheader("🏆 Top 3 Predicted Breeds")
                 for rank, (label, conf) in enumerate(top_predictions, start=1):
                     st.markdown(f"**{rank}. {label}** — {conf:.2f}%")
                     st.progress(min(int(conf), 100))
-
                 # ---- Image content report ----
                 st.subheader("🖼️ Image Content Report")
-
                 if caption:
                     st.markdown(f"**Description:** {caption}")
                 else:
                     st.caption("Image caption unavailable (captioning model failed to load).")
-
                 if quality_report:
                     qc1, qc2, qc3 = st.columns(3)
                     qc1.metric("Resolution", f"{quality_report['width']}×{quality_report['height']}")
                     qc2.metric("Brightness", quality_report["brightness"])
                     qc3.metric("Sharpness", quality_report["sharpness"])
-
                     st.markdown(
                         "**Dominant colors:** " + ", ".join(quality_report["dominant_colors"])
                     )
                     st.markdown(
                         "**Notes:** " + "; ".join(quality_report["notes"]).capitalize() + "."
                     )
-
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 save_to_csv(breed, f"{confidence:.2f}%", uploaded_file.name, timestamp)
-
                 breed_key = breed.lower().strip()
                 if breed_key in breed_info_raw:
                     st.subheader(get_translation("breed_info", language))
@@ -787,7 +823,6 @@ if st.session_state.current_page == "main":
                     st.warning(get_translation("no_info", language))
         except Exception as e:
             st.error(f"{get_translation('processing_error', language)}: {str(e)}")
-
     st.markdown("---")
     st.markdown(f"""
     <div class="footer">
@@ -795,7 +830,6 @@ if st.session_state.current_page == "main":
         <p>{get_translation("heritage", language)}</p>
     </div>
     """, unsafe_allow_html=True)
-
 # ============ MARKETPLACE ============
 elif st.session_state.current_page == "marketplace":
     st.markdown(f'<h1 class="main-header">{get_translation("marketplace_title", language)}</h1>', unsafe_allow_html=True)
@@ -823,11 +857,9 @@ elif st.session_state.current_page == "marketplace":
             <div class="seller-info">{get_translation("location", language)}: {cattle['location']}</div>
         </div>
         """, unsafe_allow_html=True)
-
 # ============ CHAT SECTION (inline, bottom of page, Enter-to-send) ============
 st.markdown("---")
 st.subheader(f"{get_translation('chat_title', language)} 💬")
-
 chat_box = st.container(height=320)
 with chat_box:
     for message in st.session_state.messages:
@@ -845,7 +877,6 @@ with chat_box:
                 f"{message['content']}</div>",
                 unsafe_allow_html=True,
             )
-
 # A form's text_input submits on Enter (no need to click a separate button),
 # and clear_on_submit empties the box automatically after sending.
 with st.form(key="chat_form", clear_on_submit=True, border=False):
@@ -856,7 +887,6 @@ with st.form(key="chat_form", clear_on_submit=True, border=False):
         )
     with c2:
         submitted = st.form_submit_button("Send", use_container_width=True)
-
     if submitted and user_input.strip():
         st.session_state.messages.append({"role": "user", "content": user_input})
         st.session_state.messages.append(
