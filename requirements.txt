@@ -10,3 +10,4 @@ gTTS
 huggingface_hub
 transformers
 plotly
+ultralytics
