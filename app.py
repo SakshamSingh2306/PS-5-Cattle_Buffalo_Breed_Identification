@@ -14,6 +14,7 @@ import random
 from huggingface_hub import hf_hub_download
 import json
 from transformers import BlipProcessor, BlipForConditionalGeneration
+import plotly.graph_objects as go
 # Set page config first
 st.set_page_config(page_title="🐄 Cattle Breed Identifier", layout="centered", initial_sidebar_state="collapsed")
 # ============ TRANSLATIONS ============
@@ -618,6 +619,30 @@ def demo_predict_topk(image, k=3):
     confidences = sorted([random.uniform(30, 90) for _ in picks], reverse=True)
     return list(zip(picks, confidences))
 # ============ IMAGE CONTENT REPORT ============
+# ============ CONFIDENCE GAUGE ============
+def render_confidence_gauge(confidence):
+    """Semi-circular dial with the confidence percentage in the middle,
+    styled like a speedometer: orange arc for the value, pale green track."""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=confidence,
+        number={"suffix": "%", "font": {"size": 30, "color": "#2c3e50"}},
+        gauge={
+            "axis": {"range": [0, 100], "visible": False},
+            "bar": {"color": "#e8491d", "thickness": 0.35},
+            "bgcolor": "white",
+            "borderwidth": 0,
+            "steps": [{"range": [0, 100], "color": "#eaf7e0"}],
+        },
+        domain={"x": [0, 1], "y": [0, 1]},
+    ))
+    fig.update_layout(
+        height=180,
+        margin=dict(l=15, r=15, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
 def analyze_image_quality(image):
     """Lightweight, model-free visual analysis of the uploaded image."""
     try:
@@ -793,9 +818,18 @@ if st.session_state.current_page == "main":
                 """, unsafe_allow_html=True)
                 # ---- Top-3 confidence report ----
                 st.subheader("🏆 Top 3 Predicted Breeds")
-                for rank, (label, conf) in enumerate(top_predictions, start=1):
-                    st.markdown(f"**{rank}. {label}** — {conf:.2f}%")
-                    st.progress(min(int(conf), 100))
+                gauge_cols = st.columns(len(top_predictions))
+                for rank, (col, (label, conf)) in enumerate(zip(gauge_cols, top_predictions), start=1):
+                    with col:
+                        st.plotly_chart(
+                            render_confidence_gauge(conf),
+                            use_container_width=True,
+                            key=f"confidence_gauge_{rank}",
+                        )
+                        st.markdown(
+                            f"<p style='text-align:center; font-weight:600; margin-top:-10px;'>{label}</p>",
+                            unsafe_allow_html=True,
+                        )
                 # ---- Image content report ----
                 st.subheader("🖼️ Image Content Report")
                 if caption:
