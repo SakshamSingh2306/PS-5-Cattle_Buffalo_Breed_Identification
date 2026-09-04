@@ -824,54 +824,42 @@ elif st.session_state.current_page == "marketplace":
         </div>
         """, unsafe_allow_html=True)
 
-# ============ CHAT WIDGET (small popup, Enter-to-send) ============
-st.markdown("""
-<style>
-/* Anchor the chat popover to the bottom-right corner like a floating widget */
-div[data-testid="stPopover"] {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    z-index: 1000;
-}
-</style>
-""", unsafe_allow_html=True)
+# ============ CHAT SECTION (inline, bottom of page, Enter-to-send) ============
+st.markdown("---")
+st.subheader(f"{get_translation('chat_title', language)} 💬")
 
-with st.popover("💬", use_container_width=False):
-    st.markdown(f"**{get_translation('chat_title', language)}**")
-
-    chat_box = st.container(height=280)
-    with chat_box:
-        for message in st.session_state.messages:
-            if message["role"] == "user":
-                st.markdown(
-                    f"<div style='max-width: 85%; padding: 8px 12px; border-radius: 12px; "
-                    f"background-color: #3498db; color: white; margin: 4px 0 4px auto;'>"
-                    f"{message['content']}</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f"<div style='max-width: 85%; padding: 8px 12px; border-radius: 12px; "
-                    f"background-color: #f1f1f1; margin: 4px auto 4px 0;'>"
-                    f"{message['content']}</div>",
-                    unsafe_allow_html=True,
-                )
-
-    # A form's text_input submits on Enter (no need to click a separate button),
-    # and clear_on_submit empties the box automatically after sending.
-    with st.form(key="chat_form", clear_on_submit=True, border=False):
-        c1, c2 = st.columns([5, 1])
-        with c1:
-            user_input = st.text_input(
-                "", placeholder="Type your message...", label_visibility="collapsed"
+chat_box = st.container(height=320)
+with chat_box:
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            st.markdown(
+                f"<div style='max-width: 60%; padding: 8px 12px; border-radius: 12px; "
+                f"background-color: #3498db; color: white; margin: 4px 0 4px auto;'>"
+                f"{message['content']}</div>",
+                unsafe_allow_html=True,
             )
-        with c2:
-            submitted = st.form_submit_button("Send", use_container_width=True)
-
-        if submitted and user_input.strip():
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            st.session_state.messages.append(
-                {"role": "assistant", "content": chatbot_response(user_input)}
+        else:
+            st.markdown(
+                f"<div style='max-width: 60%; padding: 8px 12px; border-radius: 12px; "
+                f"background-color: #f1f1f1; margin: 4px auto 4px 0;'>"
+                f"{message['content']}</div>",
+                unsafe_allow_html=True,
             )
-            st.rerun()
+
+# A form's text_input submits on Enter (no need to click a separate button),
+# and clear_on_submit empties the box automatically after sending.
+with st.form(key="chat_form", clear_on_submit=True, border=False):
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        user_input = st.text_input(
+            "", placeholder="Type your message...", label_visibility="collapsed"
+        )
+    with c2:
+        submitted = st.form_submit_button("Send", use_container_width=True)
+
+    if submitted and user_input.strip():
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.session_state.messages.append(
+            {"role": "assistant", "content": chatbot_response(user_input)}
+        )
+        st.rerun()
