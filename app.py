@@ -962,7 +962,6 @@ if st.session_state.current_page == "main":
     if uploaded_file is not None:
         try:
             image = Image.open(uploaded_file).convert('RGB')
-            st.image(image, caption="📷 Uploaded Image", use_container_width=True)
 
             # ---- Step 1: YOLO26 detection (does the image contain a cow/buffalo?) ----
             st.subheader("🎯 YOLO26 Object Detection")
