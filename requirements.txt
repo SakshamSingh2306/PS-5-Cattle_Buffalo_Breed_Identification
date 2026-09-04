@@ -9,3 +9,4 @@ pandas
 gTTS
 huggingface_hub
 transformers
+plotly
