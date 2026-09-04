@@ -7,6 +7,7 @@ import torchvision.transforms as transforms
 import timm
 import os
 import csv
+import hashlib
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
@@ -267,6 +268,10 @@ language = language_selector()
 
 # ============ DEVICE ============
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Cap CPU threads: on shared/small hosting, unbounded PyTorch thread pools
+# fight for the same cores and inflate CPU usage without speeding anything up.
+if device.type == "cpu":
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
 
 # ============ BREED LABELS ============
 @st.cache_data
@@ -461,7 +466,7 @@ def load_model():
 
             # Create ResNet-50 with 40 output classes
             model = timm.create_model(
-                "resnet50",
+                "convnext_tiny",
                 pretrained=False,
                 num_classes=len(breed_labels)
             )
@@ -505,20 +510,22 @@ def load_model():
 
 model = load_model()
 
-# ============ CAPTIONING MODEL LOADING ============
+# ============ CAPTIONING MODEL LOADING (lazy) ============
+# Not loaded at startup — only loaded the first time a user actually
+# requests an AI description, since this model adds a large amount of
+# extra RAM/CPU on top of the classifier and most sessions never need it.
 @st.cache_resource
 def load_caption_model():
     try:
         processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
         caption_model = BlipForConditionalGeneration.from_pretrained(
-            "Salesforce/blip-image-captioning-base"
+            "Salesforce/blip-image-captioning-base",
+            low_cpu_mem_usage=True,
         ).to(device)
         caption_model.eval()
         return processor, caption_model
     except Exception:
         return None, None
-
-caption_processor, caption_model = load_caption_model()
 
 # ============ PREDICTION FUNCTIONS ============
 def predict_breed(image):
@@ -533,7 +540,7 @@ def predict_breed_topk(image, k=3):
     try:
         k = min(k, len(breed_labels))
         img_tensor = transform(image).unsqueeze(0).to(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model(img_tensor)
             probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
             top_probs, top_idxs = torch.topk(probabilities, k)
@@ -566,14 +573,18 @@ def analyze_image_quality(image):
         brightness = stat.mean[0]          # 0 (dark) - 255 (bright)
         contrast = stat.stddev[0]          # low = flat/washed out, high = high contrast
 
-        # Simple sharpness estimate: variance of a Laplacian-like gradient
-        arr = np.asarray(gray, dtype=np.float32)
+        # Simple sharpness estimate: variance of a Laplacian-like gradient.
+        # Downscale first — sharpness only needs a coarse estimate and this
+        # keeps the numpy gradient computation cheap on large uploads.
+        gray_small = gray.copy()
+        gray_small.thumbnail((256, 256))
+        arr = np.asarray(gray_small, dtype=np.float32)
         gy, gx = np.gradient(arr)
         sharpness = float((gx ** 2 + gy ** 2).mean())
 
         # Dominant colors (on a downscaled copy for speed)
-        small = image.convert("RGB").resize((100, 100))
-        color_counts = small.getcolors(maxcolors=100 * 100)
+        small = image.convert("RGB").resize((80, 80))
+        color_counts = small.getcolors(maxcolors=80 * 80)
         color_counts.sort(reverse=True, key=lambda c: c[0])
         dominant_colors = [f"rgb{c[1]}" for c in color_counts[:3]]
 
@@ -605,14 +616,20 @@ def analyze_image_quality(image):
         return None
 
 def generate_caption(image):
-    """AI-generated natural-language description of the image contents."""
-    if caption_model is None or caption_processor is None:
+    """AI-generated natural-language description of the image contents.
+    Loads the captioning model on first use only (see load_caption_model)."""
+    processor, cap_model = load_caption_model()
+    if cap_model is None or processor is None:
         return None
     try:
-        inputs = caption_processor(image.convert("RGB"), return_tensors="pt").to(device)
-        with torch.no_grad():
-            out = caption_model.generate(**inputs, max_new_tokens=40)
-        caption = caption_processor.decode(out[0], skip_special_tokens=True)
+        # Downscale before captioning — BLIP doesn't need full-resolution
+        # input and this keeps memory/compute bounded for large uploads.
+        small_image = image.convert("RGB")
+        small_image.thumbnail((384, 384))
+        inputs = processor(small_image, return_tensors="pt").to(device)
+        with torch.inference_mode():
+            out = cap_model.generate(**inputs, max_new_tokens=30)
+        caption = processor.decode(out[0], skip_special_tokens=True)
         return caption.strip().capitalize()
     except Exception:
         return None
@@ -730,19 +747,45 @@ if st.session_state.current_page == "main":
 
     if uploaded_file is not None:
         try:
-            image = Image.open(uploaded_file).convert('RGB')
+            file_bytes = uploaded_file.getvalue()
+            file_hash = hashlib.md5(file_bytes).hexdigest()
+
+            image = Image.open(BytesIO(file_bytes)).convert('RGB')
             st.image(image, caption="📷 Uploaded Image", use_container_width=True)
 
-            with st.spinner(get_translation("analyzing", language)):
-                if model is not None:
-                    top_predictions = predict_breed_topk(image, k=3)
-                else:
-                    top_predictions = demo_predict_topk(image, k=3)
-                    st.info(get_translation("demo_mode", language))
+            want_caption = st.checkbox(
+                "🧠 Also generate an AI description of the image (uses extra memory & time)",
+                value=False,
+                key=f"want_caption_{file_hash}",
+            )
 
-                with st.spinner("📝 Generating image report..."):
+            # Cache results per uploaded image in session_state so that
+            # unrelated Streamlit reruns (any widget click, e.g. the
+            # checkbox above) don't re-run the classifier or captioner.
+            cache_key = f"result_{file_hash}"
+            cached = st.session_state.get(cache_key, {})
+
+            if "top_predictions" not in cached:
+                with st.spinner(get_translation("analyzing", language)):
+                    if model is not None:
+                        top_predictions = predict_breed_topk(image, k=3)
+                    else:
+                        top_predictions = demo_predict_topk(image, k=3)
+                        st.info(get_translation("demo_mode", language))
+                cached["top_predictions"] = top_predictions
+            top_predictions = cached["top_predictions"]
+
+            if "quality_report" not in cached:
+                cached["quality_report"] = analyze_image_quality(image)
+            quality_report = cached["quality_report"]
+
+            caption = cached.get("caption")
+            if want_caption and caption is None:
+                with st.spinner("📝 Generating AI description..."):
                     caption = generate_caption(image)
-                    quality_report = analyze_image_quality(image)
+                cached["caption"] = caption
+
+            st.session_state[cache_key] = cached
 
             if top_predictions:
                 breed, confidence = top_predictions[0]
@@ -763,10 +806,13 @@ if st.session_state.current_page == "main":
                 # ---- Image content report ----
                 st.subheader("🖼️ Image Content Report")
 
-                if caption:
-                    st.markdown(f"**Description:** {caption}")
+                if want_caption:
+                    if caption:
+                        st.markdown(f"**Description:** {caption}")
+                    else:
+                        st.caption("Image caption unavailable (captioning model failed to load).")
                 else:
-                    st.caption("Image caption unavailable (captioning model failed to load).")
+                    st.caption("Check the box above to also generate an AI-written description.")
 
                 if quality_report:
                     qc1, qc2, qc3 = st.columns(3)
