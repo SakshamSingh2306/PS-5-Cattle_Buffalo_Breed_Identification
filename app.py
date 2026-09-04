@@ -682,15 +682,10 @@ def chatbot_response(message):
         return "I'm here to help with cattle questions. Ask me about breeds, buying/selling, health, feeding, or general care."
 
 # ============ SESSION STATE ============
-if 'chat_open' not in st.session_state:
-    st.session_state.chat_open = False
 if 'messages' not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you with cattle-related questions?"}]
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "main"
-
-def toggle_chat():
-    st.session_state.chat_open = not st.session_state.chat_open
 
 def navigate_to(page):
     st.session_state.current_page = page
@@ -829,42 +824,54 @@ elif st.session_state.current_page == "marketplace":
         </div>
         """, unsafe_allow_html=True)
 
-# ============ CHAT TOGGLE ============
-st.markdown('<div style="position: fixed; bottom: 20px; right: 20px; z-index: 1000;">', unsafe_allow_html=True)
-if st.button("💬", key="chat_toggle", help="Chat with us"):
-    toggle_chat()
-st.markdown('</div>', unsafe_allow_html=True)
+# ============ CHAT WIDGET (small popup, Enter-to-send) ============
+st.markdown("""
+<style>
+/* Anchor the chat popover to the bottom-right corner like a floating widget */
+div[data-testid="stPopover"] {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: 1000;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# ============ CHAT INTERFACE ============
-if st.session_state.chat_open:
-    st.markdown(f"""
-    <div style='position: fixed; bottom: 90px; right: 20px; width: 350px; height: 420px; 
-                background-color: white; border-radius: 15px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); 
-                z-index: 1000; display: flex; flex-direction: column; overflow: hidden;'>
-        <div style='background-color: #3498db; color: white; padding: 15px; font-weight: bold; 
-                    border-top-left-radius: 15px; border-top-right-radius: 15px;'>
-            {get_translation("chat_title", language)} 💬
-        </div>
-        <div style='flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;'>
-    """, unsafe_allow_html=True)
-    
-    for message in st.session_state.messages:
-        if message["role"] == "user":
-            st.markdown(f"<div style='max-width: 80%; padding: 10px 15px; border-radius: 15px; background-color: #3498db; color: white; align-self: flex-end;'>{message['content']}</div>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<div style='max-width: 80%; padding: 10px 15px; border-radius: 15px; background-color: #f1f1f1; align-self: flex-start;'>{message['content']}</div>", unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    with st.container():
-        col1, col2 = st.columns([5, 1])
-        with col1:
-            user_input = st.text_input("", key="chat_input", placeholder="Type your message...", label_visibility="collapsed")
-        with col2:
-            if st.button("Send", key="chat_send", use_container_width=True):
-                if user_input.strip():
-                    st.session_state.messages.append({"role": "user", "content": user_input})
-                    st.session_state.messages.append({"role": "assistant", "content": chatbot_response(user_input)})
-                    st.rerun()
-    
-    st.markdown('</div>', unsafe_allow_html=True)
+with st.popover("💬", use_container_width=False):
+    st.markdown(f"**{get_translation('chat_title', language)}**")
+
+    chat_box = st.container(height=280)
+    with chat_box:
+        for message in st.session_state.messages:
+            if message["role"] == "user":
+                st.markdown(
+                    f"<div style='max-width: 85%; padding: 8px 12px; border-radius: 12px; "
+                    f"background-color: #3498db; color: white; margin: 4px 0 4px auto;'>"
+                    f"{message['content']}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"<div style='max-width: 85%; padding: 8px 12px; border-radius: 12px; "
+                    f"background-color: #f1f1f1; margin: 4px auto 4px 0;'>"
+                    f"{message['content']}</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # A form's text_input submits on Enter (no need to click a separate button),
+    # and clear_on_submit empties the box automatically after sending.
+    with st.form(key="chat_form", clear_on_submit=True, border=False):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            user_input = st.text_input(
+                "", placeholder="Type your message...", label_visibility="collapsed"
+            )
+        with c2:
+            submitted = st.form_submit_button("Send", use_container_width=True)
+
+        if submitted and user_input.strip():
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            st.session_state.messages.append(
+                {"role": "assistant", "content": chatbot_response(user_input)}
+            )
+            st.rerun()
