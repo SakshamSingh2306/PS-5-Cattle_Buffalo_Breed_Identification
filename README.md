@@ -2,7 +2,7 @@
 
 A Streamlit web app that identifies Indian cattle and buffalo breeds from an uploaded photo using a fine-tuned deep learning model, and pairs the prediction with breed information, image-quality analysis, a mock marketplace, and a simple chatbot assistant.
 
-**Live demo:** https://ps-5-cattle-buffalo-breed-identific.vercel.app
+**Live demo:** https://ps5cattlebuffalobreedidentification.streamlit.app
 
 ## Features
 
