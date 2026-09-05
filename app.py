@@ -15,7 +15,9 @@ from huggingface_hub import hf_hub_download
 import json
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import plotly.graph_objects as go
-from ultralytics import YOLO
+
+# NEW: multi-animal detection (YOLO26 + per-crop breed classification)
+from yolo_breed_detector import load_yolo_model, detect_and_classify
 
 # Set page config first
 st.set_page_config(page_title="🐄 Cattle Breed Identifier", layout="centered", initial_sidebar_state="collapsed")
@@ -304,13 +306,42 @@ def set_custom_style():
             letter-spacing: 0.6px;
             font-weight: 600;
         }
-        .yolo-box {
-            background-color: rgba(255, 255, 255, 0.95);
-            padding: 20px;
+        .animal-card {
+            background-color: rgba(255, 255, 255, 0.97);
             border-radius: 12px;
-            border-left: 5px solid #8e44ad;
-            margin: 15px 0;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            padding: 16px 18px;
+            margin: 10px 0;
+            box-shadow: 0 3px 8px rgba(0,0,0,0.08);
+        }
+        .animal-card-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: #2c3e50;
+        }
+        .color-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .legend-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 16px;
+            margin: 10px 0 4px 0;
+        }
+        .legend-chip {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.9rem;
+            background: rgba(255,255,255,0.9);
+            border-radius: 999px;
+            padding: 4px 12px 4px 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
         </style>
         """,
@@ -335,7 +366,6 @@ def load_breed_labels():
     )
     with open(classes_path, "r", encoding="utf-8") as f:
         classes = json.load(f)
-
     # Handle either a list or dictionary format
     if isinstance(classes, list):
         return classes
@@ -360,6 +390,7 @@ def load_breed_labels():
 
 breed_labels = load_breed_labels()
 
+
 # ============ MODEL PERFORMANCE METRICS ============
 @st.cache_data
 def load_model_metrics():
@@ -367,7 +398,7 @@ def load_model_metrics():
     Loads held-out test-set evaluation metrics for the trained model.
     Looks for a 'metrics.json' file in the same Hugging Face repo as the
     model checkpoint, e.g.:
-        {"accuracy": 91.4, "precision": 89.7, "recall": 88.3, "f1": 89.0}
+    {"accuracy": 91.4, "precision": 89.7, "recall": 88.3, "f1": 89.0}
     If that file doesn't exist yet, falls back to placeholder numbers so
     the UI never breaks — replace FALLBACK_METRICS below with your real
     evaluation results (from sklearn.metrics.classification_report or
@@ -562,8 +593,7 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-
-# ============ MODEL LOADING (in-built breed classifier) ============
+# ============ MODEL LOADING ============
 @st.cache_resource
 def load_model():
     try:
@@ -573,21 +603,18 @@ def load_model():
                 repo_id="ujjwal75/indian-bovine-breeds-model",
                 filename="Indian_bovine_finetuned_model.pth"
             )
-
-            # Create ConvNeXt-Tiny with N output classes
+            # Create ResNet-50 with 40 output classes
             model = timm.create_model(
                 "convnext_tiny",
                 pretrained=False,
                 num_classes=len(breed_labels)
             )
-
             # Load trained weights
             checkpoint = torch.load(
                 checkpoint_path,
                 map_location=device,
                 weights_only=False
             )
-
             # Handle different checkpoint formats
             if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 model.load_state_dict(
@@ -599,7 +626,6 @@ def load_model():
                 )
             else:
                 model.load_state_dict(checkpoint)
-
             model.to(device)
             model.eval()
             return model
@@ -611,6 +637,10 @@ def load_model():
 
 
 model = load_model()
+
+# NEW: YOLO26 detector, used to find every cow/buffalo in a photo before
+# each one gets passed individually to the breed classifier above.
+yolo_model = load_yolo_model()
 
 # ============ CAPTIONING MODEL LOADING ============
 @st.cache_resource
@@ -628,96 +658,8 @@ def load_caption_model():
 
 caption_processor, caption_model = load_caption_model()
 
-# ============ YOLO26 DETECTION MODEL ============
-# YOLO26 is trained on the COCO dataset, which has a "cow" class but no
-# distinct "buffalo" class — buffaloes are typically also picked up under
-# the "cow" label by general-purpose detectors, so we treat "cow" as the
-# proxy class for both cattle and buffalo detection.
-YOLO_TARGET_CLASSES = {"cow"}
-YOLO_CONFIDENCE_THRESHOLD = 0.25
 
-
-@st.cache_resource
-def load_yolo_model():
-    try:
-        return YOLO("yolo26n.pt")
-    except Exception as e:
-        st.error(f"⚠️ Could not load YOLO26 model: {str(e)}")
-        return None
-
-
-yolo_model = load_yolo_model()
-
-
-def run_yolo_detection(image):
-    """
-    Runs YOLO26 object detection on the uploaded image.
-
-    Returns a dict with:
-      - success: whether YOLO26 ran at all
-      - found_target: whether a cow/buffalo was detected
-      - target_label: the label used for the detected cow/buffalo ("cow")
-      - target_confidence: confidence % of the best cow/buffalo detection
-      - annotated_image: PIL image with YOLO26's bounding boxes drawn on it
-      - all_detections: list of (label, confidence%) for every object YOLO26
-        found in the image, sorted by confidence (used when no cow/buffalo
-        is found, so we can tell the user what WAS detected instead)
-    """
-    result = {
-        "success": False,
-        "found_target": False,
-        "target_label": None,
-        "target_confidence": 0.0,
-        "annotated_image": None,
-        "all_detections": [],
-    }
-
-    if yolo_model is None:
-        return result
-
-    try:
-        predictions = yolo_model.predict(image, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=False)
-        detection = predictions[0]
-
-        # Bounding-box visualization (BGR numpy array -> RGB PIL image)
-        annotated_bgr = detection.plot()
-        annotated_rgb = annotated_bgr[..., ::-1]
-        result["annotated_image"] = Image.fromarray(annotated_rgb)
-        result["success"] = True
-
-        names = detection.names
-        all_detections = []
-        best_target_conf = 0.0
-        best_target_label = None
-
-        boxes = detection.boxes
-        if boxes is not None:
-            for box in boxes:
-                cls_id = int(box.cls[0].item())
-                conf_pct = float(box.conf[0].item()) * 100.0
-                label = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else names[cls_id]
-                all_detections.append((label, conf_pct))
-
-                if label.lower() in YOLO_TARGET_CLASSES and conf_pct > best_target_conf:
-                    best_target_conf = conf_pct
-                    best_target_label = label
-
-        # Sort all detections by confidence, highest first
-        all_detections.sort(key=lambda item: item[1], reverse=True)
-        result["all_detections"] = all_detections
-
-        if best_target_label is not None:
-            result["found_target"] = True
-            result["target_label"] = best_target_label
-            result["target_confidence"] = best_target_conf
-
-        return result
-    except Exception as e:
-        st.error(f"⚠️ YOLO26 detection error: {str(e)}")
-        return result
-
-
-# ============ PREDICTION FUNCTIONS (in-built breed classifier) ============
+# ============ PREDICTION FUNCTIONS ============
 def predict_breed(image):
     """Kept for backward compatibility: returns only the top-1 prediction."""
     top_results = predict_breed_topk(image, k=1)
@@ -735,7 +677,6 @@ def predict_breed_topk(image, k=3):
             outputs = model(img_tensor)
             probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
             top_probs, top_idxs = torch.topk(probabilities, k)
-
         results = [
             (breed_labels[idx.item()], prob.item() * 100)
             for prob, idx in zip(top_probs, top_idxs)
@@ -863,7 +804,6 @@ def display_breed_info(breed_key, breed_data, language):
         lines = breed_data["info"].strip().split("\n")
         if len(lines) < 8:
             return
-
         info_html = f"""
         <div class="breed-info">
             <p>🧬 <b>{get_translation("pedigree", language)}</b>: {lines[0]}</p>
@@ -890,6 +830,54 @@ def display_breed_info(breed_key, breed_data, language):
         """, unsafe_allow_html=True)
     except:
         pass
+
+
+# NEW: legend of breed -> color dots, so a box's outline color can be
+# matched back to a breed name at a glance.
+def display_detection_legend(detections):
+    seen = {}
+    for d in detections:
+        seen[d["breed"]] = d["color_hex"]
+    chips = "".join(
+        f'<div class="legend-chip"><span class="color-dot" style="background:{color};"></span>{breed}</div>'
+        for breed, color in seen.items()
+    )
+    st.markdown(f'<div class="legend-row">{chips}</div>', unsafe_allow_html=True)
+
+
+# NEW: one card per detected animal, with its own gauge, top-3, and breed info.
+def display_individual_detection(detection, language):
+    st.markdown(f"""
+    <div class="animal-card">
+        <div class="animal-card-header">
+            <span class="color-dot" style="background:{detection['color_hex']};"></span>
+            Animal #{detection['id']} — {detection['species']}: {detection['breed']}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    gcol, tcol = st.columns([1, 2])
+    with gcol:
+        st.plotly_chart(
+            render_confidence_gauge(detection["confidence"]),
+            use_container_width=True,
+            key=f"gauge_animal_{detection['id']}",
+        )
+        st.caption(f"Box size: {detection['box_size'][0]}×{detection['box_size'][1]}px")
+        if detection.get("detection_confidence") is not None:
+            st.caption(f"YOLO26 detection confidence: {detection['detection_confidence']:.1f}%")
+        if detection.get("fallback_whole_image"):
+            st.caption("⚠ No box detected by YOLO26 — analyzed the whole image instead.")
+
+    with tcol:
+        st.markdown("**Top matches for this animal:**")
+        for rank, (label, conf) in enumerate(detection["top_k"], start=1):
+            st.markdown(f"{rank}. {label} — {conf:.1f}%")
+
+    breed_key = detection["breed"].lower().strip()
+    if breed_key in breed_info_raw:
+        with st.expander(f"{get_translation('breed_info', language)} — {detection['breed']}"):
+            display_breed_info(breed_key, breed_info_raw[breed_key], language)
 
 
 # ============ CHATBOT ============
@@ -963,116 +951,63 @@ if st.session_state.current_page == "main":
         try:
             image = Image.open(uploaded_file).convert('RGB')
 
-            # ---- Step 1: YOLO26 detection (does the image contain a cow/buffalo?) ----
-            st.subheader("🎯 YOLO26 Object Detection")
-            with st.spinner("🔍 Running YOLO26 detection..."):
-                yolo_result = run_yolo_detection(image)
-
-            if not yolo_result["success"]:
-                st.warning("⚠️ YOLO26 could not be run on this image. Falling back to direct breed analysis.")
-                yolo_result["found_target"] = True  # allow the breed classifier to still run
-
-            if yolo_result["found_target"]:
-                # A cow/buffalo was found — show the bounding box, then hand the
-                # ORIGINAL (un-annotated) image to the in-built breed model.
-                st.success(
-                    f"✅ Detected **{yolo_result['target_label']}** "
-                    f"({yolo_result['target_confidence']:.1f}% confidence)"
-                )
-                if yolo_result["annotated_image"] is not None:
-                    st.image(
-                        yolo_result["annotated_image"],
-                        caption="📦 YOLO26 Bounding Box Output",
-                        use_container_width=True,
+            # ---- NEW: YOLO26 scans the photo for every cow/buffalo, then
+            # each detected box is classified individually and labeled on
+            # the image with its own species/breed and color. ----
+            with st.spinner("🔍 Scanning image for cattle and buffaloes..."):
+                if model is not None:
+                    annotated_image, detections = detect_and_classify(
+                        image, yolo_model, predict_breed_topk, k=3
                     )
+                else:
+                    # Demo mode: no trained classifier available, so fall
+                    # back to the whole image with a random top-3 pick.
+                    annotated_image = image
+                    detections = []
+                    st.info(get_translation("demo_mode", language))
 
-                with st.spinner(get_translation("analyzing", language)):
-                    if model is not None:
-                        top_predictions = predict_breed_topk(image, k=3)
-                    else:
-                        top_predictions = demo_predict_topk(image, k=3)
-                        st.info(get_translation("demo_mode", language))
+            st.image(annotated_image, caption="📷 Detected & Labeled Animals", use_container_width=True)
+
+            if detections:
+                st.subheader(f"🐄🐃 {len(detections)} animal(s) detected")
+                display_detection_legend(detections)
 
                 with st.spinner("📝 Generating image report..."):
                     caption = generate_caption(image)
                     quality_report = analyze_image_quality(image)
 
-                if top_predictions:
-                    breed, confidence = top_predictions[0]
-                    st.markdown(f"""
-                    <div class="prediction-box">
-                        <p style="font-weight: bold; font-size: 1.5rem;">{get_translation("predicted_breed", language)} <b>{breed}</b></p>
-                        <p style="font-weight: bold; font-size: 1.2rem; color: #3498db;">{get_translation("confidence", language)}: {confidence:.2f}%</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # ---- Top-3 confidence report ----
-                    st.subheader("🏆 Top 3 Predicted Breeds")
-                    gauge_cols = st.columns(len(top_predictions))
-                    for rank, (col, (label, conf)) in enumerate(zip(gauge_cols, top_predictions), start=1):
-                        with col:
-                            st.plotly_chart(
-                                render_confidence_gauge(conf),
-                                use_container_width=True,
-                                key=f"confidence_gauge_{rank}",
-                            )
-                            st.markdown(
-                                f"<p style='text-align:center; font-weight:600; margin-top:-10px;'>{label}</p>",
-                                unsafe_allow_html=True,
-                            )
-
-                    # ---- Image content report ----
-                    st.subheader("🖼️ Image Content Report")
-                    if caption:
-                        st.markdown(f"**Description:** {caption}")
-                    else:
-                        st.caption("Image caption unavailable (captioning model failed to load).")
-
-                    if quality_report:
-                        qc1, qc2, qc3 = st.columns(3)
-                        qc1.metric("Resolution", f"{quality_report['width']}×{quality_report['height']}")
-                        qc2.metric("Brightness", quality_report["brightness"])
-                        qc3.metric("Sharpness", quality_report["sharpness"])
-                        st.markdown(
-                            "**Dominant colors:** " + ", ".join(quality_report["dominant_colors"])
-                        )
-                        st.markdown(
-                            "**Notes:** " + "; ".join(quality_report["notes"]).capitalize() + "."
-                        )
-
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    save_to_csv(breed, f"{confidence:.2f}%", uploaded_file.name, timestamp)
-
-                    breed_key = breed.lower().strip()
-                    if breed_key in breed_info_raw:
-                        st.subheader(get_translation("breed_info", language))
-                        display_breed_info(breed_key, breed_info_raw[breed_key], language)
-                    else:
-                        st.warning(get_translation("no_info", language))
-            else:
-                # No cow/buffalo found — report everything YOLO26 DID detect,
-                # show the bounding box output, and skip the in-built model.
-                st.error("🚫 No cow or buffalo was detected in this image.")
-                if yolo_result["all_detections"]:
-                    st.markdown("**Objects detected by YOLO26 in this image:**")
-                    detections_html = "<div class='yolo-box'><ul>"
-                    for label, conf in yolo_result["all_detections"]:
-                        detections_html += f"<li><b>{label}</b> — {conf:.1f}% confidence</li>"
-                    detections_html += "</ul></div>"
-                    st.markdown(detections_html, unsafe_allow_html=True)
+                # ---- Image content report (whole photo) ----
+                st.subheader("🖼️ Image Content Report")
+                if caption:
+                    st.markdown(f"**Description:** {caption}")
                 else:
-                    st.info("YOLO26 did not detect any recognizable objects in this image.")
+                    st.caption("Image caption unavailable (captioning model failed to load).")
 
-                if yolo_result["annotated_image"] is not None:
-                    st.image(
-                        yolo_result["annotated_image"],
-                        caption="📦 YOLO26 Bounding Box Output",
-                        use_container_width=True,
+                if quality_report:
+                    qc1, qc2, qc3 = st.columns(3)
+                    qc1.metric("Resolution", f"{quality_report['width']}×{quality_report['height']}")
+                    qc2.metric("Brightness", quality_report["brightness"])
+                    qc3.metric("Sharpness", quality_report["sharpness"])
+                    st.markdown(
+                        "**Dominant colors:** " + ", ".join(quality_report["dominant_colors"])
                     )
-                st.caption(
-                    "ℹ️ The in-built breed identification model was not run because "
-                    "no cow/buffalo was detected in this image."
-                )
+                    st.markdown(
+                        "**Notes:** " + "; ".join(quality_report["notes"]).capitalize() + "."
+                    )
+
+                # ---- Individual per-animal predictions ----
+                st.subheader("🔎 Individual Predictions")
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                for detection in detections:
+                    display_individual_detection(detection, language)
+                    save_to_csv(
+                        f"{detection['species']}:{detection['breed']}",
+                        f"{detection['confidence']:.2f}%",
+                        uploaded_file.name,
+                        timestamp,
+                    )
+            else:
+                st.warning(get_translation("confidence_error", language))
 
         except Exception as e:
             st.error(f"{get_translation('processing_error', language)}: {str(e)}")
