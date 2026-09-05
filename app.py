@@ -12,6 +12,8 @@ import pandas as pd
 from datetime import datetime
 from io import BytesIO
 import random
+import hashlib
+import colorsys
 from huggingface_hub import hf_hub_download
 import json
 import plotly.graph_objects as go
@@ -672,9 +674,25 @@ def run_cattle_detector(image):
         gc.collect()
 
 
+def color_for_label(label):
+    """Deterministic RGB color for a given label string, so the same
+    breed (or object class) always gets the same box/text color across
+    a single image and across reruns."""
+    digest = hashlib.md5(label.encode("utf-8")).hexdigest()
+    hue = int(digest[:8], 16) % 360
+    r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.48, 0.72)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
 def draw_boxes(image, boxes, box_color=(231, 76, 60), text_color=(255, 255, 255)):
     """Draws labeled bounding boxes on a copy of the image using plain
-    PIL drawing (no extra plotting dependencies)."""
+    PIL drawing (no extra plotting dependencies).
+
+    Each box dict needs "xyxy", "label", "conf". An optional per-box
+    "color" (RGB tuple) overrides box_color — used so every distinct
+    breed/class gets its own consistent color instead of one color for
+    every box.
+    """
     annotated = image.copy()
     draw = ImageDraw.Draw(annotated)
     try:
@@ -685,7 +703,8 @@ def draw_boxes(image, boxes, box_color=(231, 76, 60), text_color=(255, 255, 255)
     for box in boxes:
         x1, y1, x2, y2 = box["xyxy"]
         label = f"{box['label']} {box['conf'] * 100:.0f}%"
-        draw.rectangle([x1, y1, x2, y2], outline=box_color, width=3)
+        this_color = box.get("color", box_color)
+        draw.rectangle([x1, y1, x2, y2], outline=this_color, width=3)
 
         if font is not None:
             text_bbox = draw.textbbox((0, 0), label, font=font)
@@ -694,7 +713,7 @@ def draw_boxes(image, boxes, box_color=(231, 76, 60), text_color=(255, 255, 255)
             text_w, text_h = len(label) * 6, 12
 
         label_y = max(0, y1 - text_h - 6)
-        draw.rectangle([x1, label_y, x1 + text_w + 6, label_y + text_h + 4], fill=box_color)
+        draw.rectangle([x1, label_y, x1 + text_w + 6, label_y + text_h + 4], fill=this_color)
         draw.text((x1 + 3, label_y + 2), label, fill=text_color, font=font)
 
     return annotated
@@ -952,65 +971,102 @@ if st.session_state.current_page == "main":
 
             if not cattle_boxes:
                 # Nothing that looks like a cow/buffalo was found. Show the
-                # image with whatever the detector *did* find (if anything)
-                # and stop here — the breed classifier never runs, which is
-                # also what keeps this stage cheap.
-                annotated = draw_boxes(image, all_boxes) if all_boxes else image
+                # image with whatever the detector *did* find (if anything),
+                # each box colored and labeled by its own class, and stop
+                # here — the breed classifier never runs, which is also
+                # what keeps this stage cheap.
+                if all_boxes:
+                    boxes_to_draw = [
+                        {**b, "color": color_for_label(b["label"])} for b in all_boxes
+                    ]
+                    annotated = draw_boxes(image, boxes_to_draw)
+                else:
+                    annotated = image
                 st.image(annotated, caption="📷 Uploaded Image", use_container_width=True)
-                st.error("🚫 No cow or buffalo detected in this image. Please upload a clearer photo of cattle.")
+
+                if all_boxes:
+                    detected_names = sorted({b["label"].replace("_", " ").title() for b in all_boxes})
+                    names_str = ", ".join(detected_names)
+                    st.error(
+                        f"🚫 No cow or buffalo detected in this image. "
+                        f"Instead, the detector found: **{names_str}**."
+                    )
+                else:
+                    st.error(
+                        "🚫 No cow or buffalo detected in this image, and the detector "
+                        "didn't recognize any other objects in it either. Please upload "
+                        "a clearer photo of cattle."
+                    )
                 st.caption(
                     "The detector's pretrained classes include a generic \"cow\" label "
                     "but no separate \"buffalo\" class, so unusual angles, heavy cropping, "
                     "or poor lighting can occasionally cause a miss."
                 )
             else:
-                # ---- STAGE 2: species/breed identification on the detected region ----
-                best_box = max(cattle_boxes, key=lambda b: b["conf"])
-                x1, y1, x2, y2 = [int(round(v)) for v in best_box["xyxy"]]
-                crop = image.crop((x1, y1, x2, y2))
-
+                # ---- STAGE 2: species/breed identification on EVERY detected
+                # animal, not just the highest-confidence box. Each cattle_box
+                # found in Stage 1 is cropped out and classified independently
+                # so a photo with several cows/buffaloes gets one prediction
+                # per animal instead of a single answer for the whole image.
+                detections = []
                 with st.spinner(get_translation("analyzing", language)):
-                    if model is not None:
-                        top_predictions = predict_breed_topk(crop, k=3)
-                    else:
-                        top_predictions = demo_predict_topk(crop, k=3)
-                        st.info(get_translation("demo_mode", language))
+                    for i, box in enumerate(cattle_boxes, start=1):
+                        x1, y1, x2, y2 = [int(round(v)) for v in box["xyxy"]]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(image.width, x2), min(image.height, y2)
+                        crop = image.crop((x1, y1, x2, y2))
+                        if crop.width < 2 or crop.height < 2:
+                            continue
 
-                breed, confidence = top_predictions[0] if top_predictions else ("Cattle", best_box["conf"] * 100)
+                        if model is not None:
+                            top_predictions = predict_breed_topk(crop, k=3)
+                        else:
+                            top_predictions = demo_predict_topk(crop, k=3)
 
-                annotated = draw_boxes(
-                    image,
-                    [{"xyxy": best_box["xyxy"], "label": breed, "conf": confidence / 100.0}],
-                )
-                st.image(annotated, caption="📷 Uploaded Image", use_container_width=True)
+                        if not top_predictions:
+                            continue
 
-                with st.spinner("📝 Generating image report..."):
-                    quality_report = analyze_image_quality(image)
+                        breed, confidence = top_predictions[0]
+                        detections.append({
+                            "index": i,
+                            "box": box,
+                            "crop": crop,
+                            "breed": breed,
+                            "confidence": confidence,
+                            "top_predictions": top_predictions,
+                        })
 
-                if top_predictions:
-                    st.markdown(f"""
-                    <div class="prediction-box">
-                        <p style="font-weight: bold; font-size: 1.5rem;">{get_translation("predicted_breed", language)} <b>{breed}</b></p>
-                        <p style="font-weight: bold; font-size: 1.2rem; color: #3498db;">{get_translation("confidence", language)}: {confidence:.2f}%</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                if model is None:
+                    st.info(get_translation("demo_mode", language))
 
-                    # ---- Top-3 confidence report ----
-                    st.subheader("🏆 Top 3 Predicted Breeds")
-                    gauge_cols = st.columns(len(top_predictions))
-                    for rank, (col, (label, conf)) in enumerate(zip(gauge_cols, top_predictions), start=1):
-                        with col:
-                            st.plotly_chart(
-                                render_confidence_gauge(conf),
-                                use_container_width=True,
-                                key=f"confidence_gauge_{rank}",
-                            )
-                            st.markdown(
-                                f"<p style='text-align:center; font-weight:600; margin-top:-10px;'>{label}</p>",
-                                unsafe_allow_html=True,
-                            )
+                if not detections:
+                    st.image(image, caption="📷 Uploaded Image", use_container_width=True)
+                    st.warning(get_translation("confidence_error", language))
+                else:
+                    # Draw every box on one image, each labeled with its own
+                    # predicted breed (instead of a single box for one animal).
+                    annotated = draw_boxes(
+                        image,
+                        [
+                            {
+                                "xyxy": d["box"]["xyxy"],
+                                "label": d["breed"],
+                                "conf": d["confidence"] / 100.0,
+                                "color": color_for_label(d["breed"]),
+                            }
+                            for d in detections
+                        ],
+                    )
+                    st.image(
+                        annotated,
+                        caption=f"📷 Uploaded Image — {len(detections)} animal(s) detected",
+                        use_container_width=True,
+                    )
 
-                    # ---- Image content report ----
+                    with st.spinner("📝 Generating image report..."):
+                        quality_report = analyze_image_quality(image)
+
+                    # ---- Image content report (whole image) ----
                     st.subheader("🖼️ Image Content Report")
                     if quality_report:
                         qc1, qc2, qc3 = st.columns(3)
@@ -1025,16 +1081,54 @@ if st.session_state.current_page == "main":
                         )
 
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    save_to_csv(breed, f"{confidence:.2f}%", uploaded_file.name, timestamp)
 
-                    breed_key = breed.lower().strip()
-                    if breed_key in breed_info_raw:
-                        st.subheader(get_translation("breed_info", language))
-                        display_breed_info(breed_key, breed_info_raw[breed_key], language)
-                    else:
-                        st.warning(get_translation("no_info", language))
+                    # ---- Per-animal breed breakdown ----
+                    st.subheader(f"🐄 Detected Animals ({len(detections)})")
+                    for d in detections:
+                        with st.expander(
+                            f"Animal #{d['index']}: {d['breed']} ({d['confidence']:.1f}%)",
+                            expanded=(len(detections) == 1),
+                        ):
+                            col_img, col_pred = st.columns([1, 2])
+                            with col_img:
+                                st.image(d["crop"], use_container_width=True, caption=f"Animal #{d['index']}")
+                            with col_pred:
+                                st.markdown(f"""
+                                <div class="prediction-box">
+                                    <p style="font-weight: bold; font-size: 1.3rem;">{get_translation("predicted_breed", language)} <b>{d['breed']}</b></p>
+                                    <p style="font-weight: bold; font-size: 1.1rem; color: #3498db;">{get_translation("confidence", language)}: {d['confidence']:.2f}%</p>
+                                </div>
+                                """, unsafe_allow_html=True)
 
-                del crop
+                            # ---- Top-3 confidence report for this animal ----
+                            gauge_cols = st.columns(len(d["top_predictions"]))
+                            for rank, (col, (label, conf)) in enumerate(zip(gauge_cols, d["top_predictions"]), start=1):
+                                with col:
+                                    st.plotly_chart(
+                                        render_confidence_gauge(conf),
+                                        use_container_width=True,
+                                        key=f"confidence_gauge_{d['index']}_{rank}",
+                                    )
+                                    st.markdown(
+                                        f"<p style='text-align:center; font-weight:600; margin-top:-10px;'>{label}</p>",
+                                        unsafe_allow_html=True,
+                                    )
+
+                            breed_key = d["breed"].lower().strip()
+                            if breed_key in breed_info_raw:
+                                st.markdown(f"**{get_translation('breed_info', language)}**")
+                                display_breed_info(breed_key, breed_info_raw[breed_key], language)
+                            else:
+                                st.warning(get_translation("no_info", language))
+
+                            save_to_csv(
+                                d["breed"],
+                                f"{d['confidence']:.2f}%",
+                                f"{uploaded_file.name}#animal{d['index']}",
+                                timestamp,
+                            )
+
+                del detections
 
             # Free the decoded image and any large intermediates now that
             # we're done with them, rather than waiting for Streamlit's
