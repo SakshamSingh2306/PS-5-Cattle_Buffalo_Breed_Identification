@@ -15,8 +15,13 @@ from huggingface_hub import hf_hub_download
 import json
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import plotly.graph_objects as go
+
+# NEW: multi-animal detection (YOLO26 + per-crop breed classification)
+from yolo_breed_detector import load_yolo_model, detect_and_classify
+
 # Set page config first
 st.set_page_config(page_title="🐄 Cattle Breed Identifier", layout="centered", initial_sidebar_state="collapsed")
+
 # ============ TRANSLATIONS ============
 def get_translation(key, language="en"):
     translations = {
@@ -190,12 +195,16 @@ def get_translation(key, language="en"):
         }
     }
     return translations.get(language, translations["en"]).get(key, key)
+
+
 def language_selector():
     st.sidebar.markdown("---")
     st.sidebar.header("🌐 Language")
     language = st.sidebar.radio("Select Language", ["English", "Hindi", "Telugu"], index=0, label_visibility="collapsed")
     lang_map = {"English": "en", "Hindi": "hi", "Telugu": "te"}
     return lang_map[language]
+
+
 # ============ STYLING ============
 def set_custom_style():
     st.markdown(
@@ -297,15 +306,57 @@ def set_custom_style():
             letter-spacing: 0.6px;
             font-weight: 600;
         }
+        .animal-card {
+            background-color: rgba(255, 255, 255, 0.97);
+            border-radius: 12px;
+            padding: 16px 18px;
+            margin: 10px 0;
+            box-shadow: 0 3px 8px rgba(0,0,0,0.08);
+        }
+        .animal-card-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: #2c3e50;
+        }
+        .color-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .legend-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 16px;
+            margin: 10px 0 4px 0;
+        }
+        .legend-chip {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.9rem;
+            background: rgba(255,255,255,0.9);
+            border-radius: 999px;
+            padding: 4px 12px 4px 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
         </style>
         """,
         unsafe_allow_html=True
     )
+
+
 set_custom_style()
+
 # ============ LANGUAGE ============
 language = language_selector()
+
 # ============ DEVICE ============
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 # ============ BREED LABELS ============
 @st.cache_data
 def load_breed_labels():
@@ -335,17 +386,19 @@ def load_breed_labels():
                 )
             ]
     raise ValueError("Unsupported classes.json format")
+
+
 breed_labels = load_breed_labels()
+
+
 # ============ MODEL PERFORMANCE METRICS ============
 @st.cache_data
 def load_model_metrics():
     """
     Loads held-out test-set evaluation metrics for the trained model.
-
     Looks for a 'metrics.json' file in the same Hugging Face repo as the
     model checkpoint, e.g.:
-        {"accuracy": 91.4, "precision": 89.7, "recall": 88.3, "f1": 89.0}
-
+    {"accuracy": 91.4, "precision": 89.7, "recall": 88.3, "f1": 89.0}
     If that file doesn't exist yet, falls back to placeholder numbers so
     the UI never breaks — replace FALLBACK_METRICS below with your real
     evaluation results (from sklearn.metrics.classification_report or
@@ -372,7 +425,11 @@ def load_model_metrics():
         }
     except Exception:
         return FALLBACK_METRICS
+
+
 model_metrics = load_model_metrics()
+
+
 def display_model_metrics(metrics, language="en"):
     """Renders accuracy / precision / recall / F1 as neat colored metric cards."""
     cards = [
@@ -394,6 +451,8 @@ def display_model_metrics(metrics, language="en"):
             unsafe_allow_html=True,
         )
     st.caption(f"ℹ️ {get_translation('metrics_note', language)}")
+
+
 # ============ BREED INFO ============
 breed_info_raw = {
     "gir": {
@@ -525,6 +584,7 @@ GOOD MILK YIELD IN ARID CONDITIONS""",
         }
     }
 }
+
 # ============ IMAGE TRANSFORM ============
 IMG_SIZE = 224
 transform = transforms.Compose([
@@ -532,6 +592,7 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
+
 # ============ MODEL LOADING ============
 @st.cache_resource
 def load_model():
@@ -573,7 +634,14 @@ def load_model():
             f"Model loading error: {str(e)}"
         )
         return None
+
+
 model = load_model()
+
+# NEW: YOLO26 detector, used to find every cow/buffalo in a photo before
+# each one gets passed individually to the breed classifier above.
+yolo_model = load_yolo_model()
+
 # ============ CAPTIONING MODEL LOADING ============
 @st.cache_resource
 def load_caption_model():
@@ -586,7 +654,11 @@ def load_caption_model():
         return processor, caption_model
     except Exception:
         return None, None
+
+
 caption_processor, caption_model = load_caption_model()
+
+
 # ============ PREDICTION FUNCTIONS ============
 def predict_breed(image):
     """Kept for backward compatibility: returns only the top-1 prediction."""
@@ -594,6 +666,8 @@ def predict_breed(image):
     if not top_results:
         return None, 0
     return top_results[0]
+
+
 def predict_breed_topk(image, k=3):
     """Returns a list of (label, confidence_percent) tuples for the top-k classes."""
     try:
@@ -610,15 +684,20 @@ def predict_breed_topk(image, k=3):
         return results
     except Exception:
         return []
+
+
 def demo_predict(image):
     breed = random.choice(breed_labels)
     confidence = random.uniform(65, 90)
     return breed, confidence
+
+
 def demo_predict_topk(image, k=3):
     picks = random.sample(breed_labels, min(k, len(breed_labels)))
     confidences = sorted([random.uniform(30, 90) for _ in picks], reverse=True)
     return list(zip(picks, confidences))
-# ============ IMAGE CONTENT REPORT ============
+
+
 # ============ CONFIDENCE GAUGE ============
 def render_confidence_gauge(confidence):
     """Semi-circular dial with the confidence percentage in the middle,
@@ -643,23 +722,27 @@ def render_confidence_gauge(confidence):
     )
     return fig
 
+
 def analyze_image_quality(image):
     """Lightweight, model-free visual analysis of the uploaded image."""
     try:
         width, height = image.size
         gray = image.convert("L")
         stat = ImageStat.Stat(gray)
-        brightness = stat.mean[0]          # 0 (dark) - 255 (bright)
-        contrast = stat.stddev[0]          # low = flat/washed out, high = high contrast
+        brightness = stat.mean[0]  # 0 (dark) - 255 (bright)
+        contrast = stat.stddev[0]  # low = flat/washed out, high = high contrast
+
         # Simple sharpness estimate: variance of a Laplacian-like gradient
         arr = np.asarray(gray, dtype=np.float32)
         gy, gx = np.gradient(arr)
         sharpness = float((gx ** 2 + gy ** 2).mean())
+
         # Dominant colors (on a downscaled copy for speed)
         small = image.convert("RGB").resize((100, 100))
         color_counts = small.getcolors(maxcolors=100 * 100)
         color_counts.sort(reverse=True, key=lambda c: c[0])
         dominant_colors = [f"rgb{c[1]}" for c in color_counts[:3]]
+
         # Human-readable quality flags
         notes = []
         if brightness < 60:
@@ -674,6 +757,7 @@ def analyze_image_quality(image):
             notes.append("resolution is low, which can reduce prediction accuracy")
         if not notes:
             notes.append("good overall image quality for analysis")
+
         return {
             "width": width,
             "height": height,
@@ -685,6 +769,8 @@ def analyze_image_quality(image):
         }
     except Exception:
         return None
+
+
 def generate_caption(image):
     """AI-generated natural-language description of the image contents."""
     if caption_model is None or caption_processor is None:
@@ -697,6 +783,8 @@ def generate_caption(image):
         return caption.strip().capitalize()
     except Exception:
         return None
+
+
 def save_to_csv(breed, confidence, filename, timestamp):
     try:
         csv_file = "cattle_classification_data.csv"
@@ -708,13 +796,14 @@ def save_to_csv(breed, confidence, filename, timestamp):
             writer.writerow({'timestamp': timestamp, 'breed': breed, 'confidence': confidence, 'filename': filename})
     except:
         pass
+
+
 # ============ DISPLAY BREED INFO ============
 def display_breed_info(breed_key, breed_data, language):
     try:
         lines = breed_data["info"].strip().split("\n")
         if len(lines) < 8:
             return
-        
         info_html = f"""
         <div class="breed-info">
             <p>🧬 <b>{get_translation("pedigree", language)}</b>: {lines[0]}</p>
@@ -728,6 +817,7 @@ def display_breed_info(breed_key, breed_data, language):
         </div>
         """
         st.markdown(info_html, unsafe_allow_html=True)
+
         measurements = breed_data["measurements"]
         st.markdown(f"""
         <div style="background-color: rgba(232, 244, 248, 0.95); padding: 20px; border-radius: 10px; border-left: 5px solid #e74c3c; margin: 15px 0;">
@@ -740,6 +830,56 @@ def display_breed_info(breed_key, breed_data, language):
         """, unsafe_allow_html=True)
     except:
         pass
+
+
+# NEW: legend of breed -> color dots, so a box's outline color can be
+# matched back to a breed name at a glance.
+def display_detection_legend(detections):
+    seen = {}
+    for d in detections:
+        seen[d["breed"]] = d["color_hex"]
+    chips = "".join(
+        f'<div class="legend-chip"><span class="color-dot" style="background:{color};"></span>{breed}</div>'
+        for breed, color in seen.items()
+    )
+    st.markdown(f'<div class="legend-row">{chips}</div>', unsafe_allow_html=True)
+
+
+# NEW: one card per detected animal, with its own gauge, top-3, and breed info.
+def display_individual_detection(detection, language):
+    st.markdown(f"""
+    <div class="animal-card">
+        <div class="animal-card-header">
+            <span class="color-dot" style="background:{detection['color_hex']};"></span>
+            Animal #{detection['id']} — {detection['species']}: {detection['breed']}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    gcol, tcol = st.columns([1, 2])
+    with gcol:
+        st.plotly_chart(
+            render_confidence_gauge(detection["confidence"]),
+            use_container_width=True,
+            key=f"gauge_animal_{detection['id']}",
+        )
+        st.caption(f"Box size: {detection['box_size'][0]}×{detection['box_size'][1]}px")
+        if detection.get("detection_confidence") is not None:
+            st.caption(f"YOLO26 detection confidence: {detection['detection_confidence']:.1f}%")
+        if detection.get("fallback_whole_image"):
+            st.caption("⚠ No box detected by YOLO26 — analyzed the whole image instead.")
+
+    with tcol:
+        st.markdown("**Top matches for this animal:**")
+        for rank, (label, conf) in enumerate(detection["top_k"], start=1):
+            st.markdown(f"{rank}. {label} — {conf:.1f}%")
+
+    breed_key = detection["breed"].lower().strip()
+    if breed_key in breed_info_raw:
+        with st.expander(f"{get_translation('breed_info', language)} — {detection['breed']}"):
+            display_breed_info(breed_key, breed_info_raw[breed_key], language)
+
+
 # ============ CHATBOT ============
 def chatbot_response(message):
     message = message.lower()
@@ -757,13 +897,19 @@ def chatbot_response(message):
         return "Milk production varies by breed. Holstein Friesian can produce 20-30 liters/day, while indigenous breeds produce 10-15 liters/day."
     else:
         return "I'm here to help with cattle questions. Ask me about breeds, buying/selling, health, feeding, or general care."
+
+
 # ============ SESSION STATE ============
 if 'messages' not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you with cattle-related questions?"}]
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "main"
+
+
 def navigate_to(page):
     st.session_state.current_page = page
+
+
 # ============ SIDEBAR ============
 with st.sidebar:
     st.header("📊 Classification History")
@@ -779,63 +925,64 @@ with st.sidebar:
             st.info("No history available")
     else:
         st.info("No history available")
-    
+
     st.markdown("---")
     st.info("🐄 Indian Cattle Breed Identifier\n\nIdentifies over 40 Indian cattle breeds using AI.")
+
+
 # ============ MAIN APP ============
 if st.session_state.current_page == "main":
     st.markdown(f'<h1 class="main-header">{get_translation("title", language)}</h1>', unsafe_allow_html=True)
     st.markdown(f'<h2 class="sub-header">{get_translation("subtitle", language)}</h2>', unsafe_allow_html=True)
     st.info(get_translation("upload_info", language))
+
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         if st.button(get_translation("marketplace_button", language), use_container_width=True):
             navigate_to("marketplace")
+
     # ---- Model performance snapshot ----
     with st.expander(get_translation("model_performance", language), expanded=True):
         display_model_metrics(model_metrics, language)
+
     uploaded_file = st.file_uploader(get_translation("upload_label", language), type=["jpg", "jpeg", "png"])
+
     if uploaded_file is not None:
         try:
             image = Image.open(uploaded_file).convert('RGB')
-            st.image(image, caption="📷 Uploaded Image", use_container_width=True)
-            with st.spinner(get_translation("analyzing", language)):
+
+            # ---- NEW: YOLO26 scans the photo for every cow/buffalo, then
+            # each detected box is classified individually and labeled on
+            # the image with its own species/breed and color. ----
+            with st.spinner("🔍 Scanning image for cattle and buffaloes..."):
                 if model is not None:
-                    top_predictions = predict_breed_topk(image, k=3)
+                    annotated_image, detections = detect_and_classify(
+                        image, yolo_model, predict_breed_topk, k=3
+                    )
                 else:
-                    top_predictions = demo_predict_topk(image, k=3)
+                    # Demo mode: no trained classifier available, so fall
+                    # back to the whole image with a random top-3 pick.
+                    annotated_image = image
+                    detections = []
                     st.info(get_translation("demo_mode", language))
+
+            st.image(annotated_image, caption="📷 Detected & Labeled Animals", use_container_width=True)
+
+            if detections:
+                st.subheader(f"🐄🐃 {len(detections)} animal(s) detected")
+                display_detection_legend(detections)
+
                 with st.spinner("📝 Generating image report..."):
                     caption = generate_caption(image)
                     quality_report = analyze_image_quality(image)
-            if top_predictions:
-                breed, confidence = top_predictions[0]
-                st.markdown(f"""
-                <div class="prediction-box">
-                    <p style="font-weight: bold; font-size: 1.5rem;">{get_translation("predicted_breed", language)} <b>{breed}</b></p>
-                    <p style="font-weight: bold; font-size: 1.2rem; color: #3498db;">{get_translation("confidence", language)}: {confidence:.2f}%</p>
-                </div>
-                """, unsafe_allow_html=True)
-                # ---- Top-3 confidence report ----
-                st.subheader("🏆 Top 3 Predicted Breeds")
-                gauge_cols = st.columns(len(top_predictions))
-                for rank, (col, (label, conf)) in enumerate(zip(gauge_cols, top_predictions), start=1):
-                    with col:
-                        st.plotly_chart(
-                            render_confidence_gauge(conf),
-                            use_container_width=True,
-                            key=f"confidence_gauge_{rank}",
-                        )
-                        st.markdown(
-                            f"<p style='text-align:center; font-weight:600; margin-top:-10px;'>{label}</p>",
-                            unsafe_allow_html=True,
-                        )
-                # ---- Image content report ----
+
+                # ---- Image content report (whole photo) ----
                 st.subheader("🖼️ Image Content Report")
                 if caption:
                     st.markdown(f"**Description:** {caption}")
                 else:
                     st.caption("Image caption unavailable (captioning model failed to load).")
+
                 if quality_report:
                     qc1, qc2, qc3 = st.columns(3)
                     qc1.metric("Resolution", f"{quality_report['width']}×{quality_report['height']}")
@@ -847,16 +994,24 @@ if st.session_state.current_page == "main":
                     st.markdown(
                         "**Notes:** " + "; ".join(quality_report["notes"]).capitalize() + "."
                     )
+
+                # ---- Individual per-animal predictions ----
+                st.subheader("🔎 Individual Predictions")
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                save_to_csv(breed, f"{confidence:.2f}%", uploaded_file.name, timestamp)
-                breed_key = breed.lower().strip()
-                if breed_key in breed_info_raw:
-                    st.subheader(get_translation("breed_info", language))
-                    display_breed_info(breed_key, breed_info_raw[breed_key], language)
-                else:
-                    st.warning(get_translation("no_info", language))
+                for detection in detections:
+                    display_individual_detection(detection, language)
+                    save_to_csv(
+                        f"{detection['species']}:{detection['breed']}",
+                        f"{detection['confidence']:.2f}%",
+                        uploaded_file.name,
+                        timestamp,
+                    )
+            else:
+                st.warning(get_translation("confidence_error", language))
+
         except Exception as e:
             st.error(f"{get_translation('processing_error', language)}: {str(e)}")
+
     st.markdown("---")
     st.markdown(f"""
     <div class="footer">
@@ -864,13 +1019,14 @@ if st.session_state.current_page == "main":
         <p>{get_translation("heritage", language)}</p>
     </div>
     """, unsafe_allow_html=True)
+
 # ============ MARKETPLACE ============
 elif st.session_state.current_page == "marketplace":
     st.markdown(f'<h1 class="main-header">{get_translation("marketplace_title", language)}</h1>', unsafe_allow_html=True)
-    
+
     if st.button(get_translation("back_button", language)):
         navigate_to("main")
-    
+
     marketplace_data = [
         {"name": "Gir Cow", "price": "₹65,000", "seller": "Rajesh Farms", "contact": "+91 98765 43210", "location": "Ahmedabad, Gujarat", "age": "4 years", "milk_yield": "12-15 L/day"},
         {"name": "Murrah Buffalo", "price": "₹85,000", "seller": "Singh Dairy", "contact": "+91 97654 32109", "location": "Ludhiana, Punjab", "age": "5 years", "milk_yield": "8-10 L/day"},
@@ -878,7 +1034,7 @@ elif st.session_state.current_page == "marketplace":
         {"name": "Jersey Cow", "price": "₹45,000", "seller": "Modern Dairy", "contact": "+91 95432 10987", "location": "Pune, Maharashtra", "age": "4 years", "milk_yield": "18-20 L/day"},
         {"name": "Holstein Friesian", "price": "₹75,000", "seller": "Elite Dairy Farms", "contact": "+91 93210 98765", "location": "Bangalore, Karnataka", "age": "3 years", "milk_yield": "22-25 L/day"}
     ]
-    
+
     for cattle in marketplace_data:
         st.markdown(f"""
         <div class="cattle-card">
@@ -891,36 +1047,40 @@ elif st.session_state.current_page == "marketplace":
             <div class="seller-info">{get_translation("location", language)}: {cattle['location']}</div>
         </div>
         """, unsafe_allow_html=True)
-# ============ CHAT SECTION (inline, bottom of page, Enter-to-send) ============
-st.markdown("---")
-st.subheader(f"{get_translation('chat_title', language)} 💬")
-chat_box = st.container(height=320)
-with chat_box:
-    for message in st.session_state.messages:
-        if message["role"] == "user":
-            st.markdown(
-                f"<div style='max-width: 60%; padding: 8px 12px; border-radius: 12px; "
-                f"background-color: #3498db; color: white; margin: 4px 0 4px auto;'>"
-                f"{message['content']}</div>",
-                unsafe_allow_html=True,
+
+    # ============ CHAT SECTION (inline, bottom of page, Enter-to-send) ============
+    st.markdown("---")
+    st.subheader(f"{get_translation('chat_title', language)} 💬")
+
+    chat_box = st.container(height=320)
+    with chat_box:
+        for message in st.session_state.messages:
+            if message["role"] == "user":
+                st.markdown(
+                    f"<div style='max-width: 60%; padding: 8px 12px; border-radius: 12px; "
+                    f"background-color: #3498db; color: white; margin: 4px 0 4px auto;'>"
+                    f"{message['content']}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"<div style='max-width: 60%; padding: 8px 12px; border-radius: 12px; "
+                    f"background-color: #f1f1f1; margin: 4px auto 4px 0;'>"
+                    f"{message['content']}</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # A form's text_input submits on Enter (no need to click a separate button),
+    # and clear_on_submit empties the box automatically after sending.
+    with st.form(key="chat_form", clear_on_submit=True, border=False):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            user_input = st.text_input(
+                "", placeholder="Type your message...", label_visibility="collapsed"
             )
-        else:
-            st.markdown(
-                f"<div style='max-width: 60%; padding: 8px 12px; border-radius: 12px; "
-                f"background-color: #f1f1f1; margin: 4px auto 4px 0;'>"
-                f"{message['content']}</div>",
-                unsafe_allow_html=True,
-            )
-# A form's text_input submits on Enter (no need to click a separate button),
-# and clear_on_submit empties the box automatically after sending.
-with st.form(key="chat_form", clear_on_submit=True, border=False):
-    c1, c2 = st.columns([5, 1])
-    with c1:
-        user_input = st.text_input(
-            "", placeholder="Type your message...", label_visibility="collapsed"
-        )
-    with c2:
-        submitted = st.form_submit_button("Send", use_container_width=True)
+        with c2:
+            submitted = st.form_submit_button("Send", use_container_width=True)
+
     if submitted and user_input.strip():
         st.session_state.messages.append({"role": "user", "content": user_input})
         st.session_state.messages.append(
